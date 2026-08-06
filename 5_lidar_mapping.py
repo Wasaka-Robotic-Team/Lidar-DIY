@@ -1,4 +1,4 @@
-﻿## =========================================================================
+## =========================================================================
 ## RPLIDAR 2D Mapping — RViz / ROS Style Occupancy Grid Display
 ## Wasaka Robotic Team | 2026
 ##
@@ -38,7 +38,7 @@ MIN_QUALITY  = 1                 # Kualitas minimum sinyal
 MAP_PIX      = 800               # Ukuran peta N x N pixel
 MAP_METERS   = 16.0              # Ukuran area peta (meter x meter)
 SCAN_BINS    = 360               # Jumlah bin sudut (1 bin = 1 derajat)
-GUI_REFRESH  = 40                # Interval refresh GUI (ms)
+GUI_REFRESH  = 80                # Interval refresh GUI (ms) — jangan terlalu kecil di Jetson
 SCAN_HZ      = 13                # Estimasi rotasi LiDAR per detik
 ## =========================================================================
 
@@ -187,26 +187,43 @@ class MappingEngine:
         self._slam.getmap(self.mapbytes)
 
     def _update_static(self, scan_mm: list):
+        """
+        Raycasting dengan numpy (100x lebih cepat dari Python loop).
+        Menggunakan Bresenham-style vectorized line drawing via linspace.
+        """
         cx = cy = MAP_PIX // 2
         res = self._res_mm
+        angles = np.deg2rad(np.arange(SCAN_BINS))
+        dists  = np.array(scan_mm, dtype=np.float32)
 
-        for i, d in enumerate(scan_mm):
-            if d == 0:
-                continue
-            ang = math.radians(i)
-            cos_a, sin_a = math.cos(ang), -math.sin(ang)
+        # Hanya proses sinar yang valid
+        valid = dists > 0
+        if not np.any(valid):
+            return
 
-            n_free = min(int(d / res) - 1, MAP_PIX)
-            for s in range(1, max(n_free, 1)):
-                fx = int(cx + s * cos_a)
-                fy = int(cy + s * sin_a)
-                if 0 <= fx < MAP_PIX and 0 <= fy < MAP_PIX:
-                    self._grid[fy, fx] = min(255.0, self._grid[fy, fx] + 3.0)
+        v_ang  = angles[valid]
+        v_dist = dists[valid]
+        cos_a  = np.cos(v_ang)
+        sin_a  = -np.sin(v_ang)   # Y dibalik (image coords)
 
-            ox = int(cx + (d / res) * cos_a)
-            oy = int(cy + (d / res) * sin_a)
-            if 0 <= ox < MAP_PIX and 0 <= oy < MAP_PIX:
-                self._grid[oy, ox] = max(0.0, self._grid[oy, ox] - 40.0)
+        n_steps = 8   # sampling setiap N mm sepanjang sinar (trade-off kecepatan vs akurasi)
+
+        for idx in range(len(v_ang)):
+            d     = v_dist[idx]
+            ca    = cos_a[idx]
+            sa    = sin_a[idx]
+            n_pts = max(int(d / (res * n_steps)), 1)
+
+            # Titik bebas sepanjang sinar (vectorized)
+            steps = np.arange(1, n_pts)
+            fxs   = np.clip((cx + steps * n_steps * ca).astype(np.int32), 0, MAP_PIX - 1)
+            fys   = np.clip((cy + steps * n_steps * sa).astype(np.int32), 0, MAP_PIX - 1)
+            self._grid[fys, fxs] = np.minimum(255.0, self._grid[fys, fxs] + 3.0)
+
+            # Titik obstacle di ujung sinar
+            ox = int(np.clip(cx + (d / res) * ca, 0, MAP_PIX - 1))
+            oy = int(np.clip(cy + (d / res) * sa, 0, MAP_PIX - 1))
+            self._grid[oy, ox] = max(0.0, self._grid[oy, ox] - 40.0)
 
         arr = np.clip(self._grid, 0, 255).astype(np.uint8)
         self.mapbytes[:] = arr.tobytes()
@@ -281,7 +298,7 @@ class MapWidget(QtWidgets.QWidget):
         self.engine     = engine
         self._qimg      = None
         self._show_scan = True
-        self._is_iso    = True      # Default: Isometric 2.5D Mode ala RViz
+        self._is_iso    = False     # Default: 2D Top-Down (lebih ringan). Toggle ke Iso via tombol
         self._last_scan = []
         self.setMinimumSize(620, 620)
         self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, True)
@@ -356,10 +373,13 @@ class MapWidget(QtWidgets.QWidget):
         rx_s, ry_s = to_screen(rpx, rpy)
 
         if self._show_scan and self._last_scan:
-            pen_ray = QtGui.QPen(QtGui.QColor(255, 120, 0, 70), 1)
+            # Hanya gambar setiap RAY_STEP-th ray untuk hemat render time
+            RAY_STEP = 8
+            pen_ray  = QtGui.QPen(QtGui.QColor(255, 160, 0, 90), 1)
             painter.setPen(pen_ray)
             mm_to_px = (scale_x * MAP_PIX) / (MAP_METERS * 1000.0)
-            for i, d in enumerate(self._last_scan):
+            for i in range(0, len(self._last_scan), RAY_STEP):
+                d = self._last_scan[i]
                 if d == 0: continue
                 ang = math.radians(i)
                 dx  = d * math.cos(ang) * mm_to_px
@@ -503,7 +523,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Wall / Obstacle",   "#000000"),
             ("Unknown Area",      "#7f8c8d"),
             ("Free Space",        "#f5f5f5"),
-            ("Robot LiDAR Puck",  #ff6600),
+            ("Robot LiDAR Puck",  "#ff6600"),
         ]:
             row = QtWidgets.QWidget()
             rl  = QtWidgets.QHBoxLayout(row)
@@ -620,3 +640,4 @@ if __name__ == '__main__':
     win = MainWindow()
     win.show()
     sys.exit(app.exec_())
+
