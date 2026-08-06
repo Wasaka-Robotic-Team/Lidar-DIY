@@ -1,13 +1,12 @@
 ## =========================================================================
-## RPLIDAR 2D Mapping — RViz Style | Wasaka Robotic | 2026
-## v3 — Fix: MapUpdateWorker thread + Fast occupancy convergence
+## RPLIDAR 2D Mapping — RViz Block Style | Wasaka Robotic | 2026
+## v4 — Coarse Grid + Continuous Ray Tracing = Tampilan Blok RViz
 ##
-## Perbaikan v3:
-##   - MapUpdateWorker: komputasi peta di thread terpisah (tidak freeze UI)
-##   - Occupancy grid agresif: putih/hitam muncul dalam 1-2 rotasi
-##   - MAP_PIX dikurangi ke 600 untuk ringankan beban Jetson
-##   - Sinar scan OFF by default (hemat render time)
-##   - Default view: 2D (toggle ke 2.5D Isometric via tombol)
+## Perubahan v4:
+##   - Grid internal 50x50 sel (bukan 600x600 piksel)
+##   - Ray tracing kontinu (trace SEMUA sel dilewati sinar)
+##   - Upscale tajam (FastTransformation) → tampilan blok kotak RViz
+##   - Komputasi di MapUpdateWorker (thread terpisah, tidak freeze)
 ##
 ## Install: pip install pyserial numpy PyQt5
 ## Run    : python3 5_lidar_mapping.py
@@ -31,10 +30,12 @@ BAUD_RATE    = 115200
 MIN_DIST_MM  = 100
 MAX_DIST_MM  = 8000
 MIN_QUALITY  = 1
-MAP_PIX      = 600               # Dikurangi 800->600 agar lebih ringan di Jetson
-MAP_METERS   = 16.0
+MAP_METERS   = 16.0          # Luas area peta (meter x meter)
+GRID_N       = 50            # Grid internal N x N sel
+CELL_MM      = MAP_METERS * 1000 / GRID_N   # mm per sel = 320 mm
+DISPLAY_PIX  = 600           # Ukuran tampilan layar (pixel)
 SCAN_BINS    = 360
-GUI_REFRESH  = 100               # ms — 10 fps cukup untuk mapping
+GUI_REFRESH  = 100           # ms
 SCAN_HZ      = 13
 ## =========================================================================
 
@@ -128,34 +129,39 @@ def normalize_scan(points):
 
 
 # ---------------------------------------------------------------------------
-# MESIN PEMETAAN
+# MESIN PEMETAAN — Grid Internal GRID_N x GRID_N
 # ---------------------------------------------------------------------------
 
 class MappingEngine:
     """
-    Occupancy grid dengan konvergensi cepat:
-      - Grid mulai di 128 (abu = unknown)
-      - Free space : +25 per sample  → putih dalam 1-2 rotasi
-      - Obstacle   : -80 per hit     → hitam setelah 1 hit
-      - Render     : <100=hitam, 128±15=abu, >143=putih
+    Grid internal kecil (GRID_N x GRID_N = 50x50 sel).
+    Setiap sel = CELL_MM x CELL_MM mm = 320mm x 320mm.
+
+    Ray tracing KONTINU: setiap sel yang dilewati sinar ditandai.
+    Ini mengisi ruang bebas sebagai blok solid (bukan titik-titik).
+
+    Render: grid kecil di-upscale ke DISPLAY_PIX dengan FastTransformation
+    → tampilan blok kotak ala RViz / Minecraft.
     """
 
     def __init__(self):
-        self.mode     = 'slam' if SLAM_MODE else 'static'
-        self.mapbytes = bytearray(MAP_PIX * MAP_PIX)
-        self.pose     = (0.0, 0.0, 0.0)
-        self.path_px  = []
-        self._lock    = QtCore.QMutex()   # Proteksi akses grid dari 2 thread
+        self.mode    = 'slam' if SLAM_MODE else 'static'
+        self.pose    = (0.0, 0.0, 0.0)    # x_mm, y_mm, theta_deg
+        self.path_px = []
+        self._lock   = QtCore.QMutex()
 
         if self.mode == 'slam':
+            # BreezySlam menggunakan piksel grid sendiri
+            self._map_pix  = 400
+            self.mapbytes  = bytearray(self._map_pix * self._map_pix)
             laser = Laser(SCAN_BINS, SCAN_HZ, 360, 0, 0, 0)
-            self._slam = RMHC_SLAM(laser, MAP_PIX, MAP_METERS, random_seed=42)
+            self._slam = RMHC_SLAM(laser, self._map_pix, MAP_METERS, random_seed=42)
         else:
-            self._grid   = np.full((MAP_PIX, MAP_PIX), 128.0, dtype=np.float32)
-            self._res_mm = (MAP_METERS * 1000) / MAP_PIX   # mm per pixel
+            # Grid internal 50x50 float
+            self.mapbytes = bytearray(GRID_N * GRID_N)  # tidak dipakai langsung
+            self._grid    = np.full((GRID_N, GRID_N), 128.0, dtype=np.float32)
 
     def update(self, scan_mm):
-        """Dipanggil dari MapUpdateWorker (bukan UI thread)."""
         if self.mode == 'slam':
             self._update_slam(scan_mm)
         else:
@@ -175,14 +181,21 @@ class MappingEngine:
 
     def _update_static(self, scan_mm):
         """
-        Raycasting sepenuhnya dengan numpy — tanpa Python loop dalam.
-        Konvergensi cepat: free=+25, obstacle=-80
+        Ray tracing kontinu pada grid GRID_N x GRID_N.
+
+        Untuk setiap sinar yang valid:
+          1. Hitung berapa sel yang dilewati: n = dist_mm / CELL_MM
+          2. Tandai SEMUA sel dari pusat hingga n-1 sebagai FREE (+35)
+          3. Tandai sel ke-n sebagai OBSTACLE (-80)
+
+        Hasilnya: jalur sinar = blok putih solid, ujung = blok hitam.
         """
-        cx = cy = MAP_PIX // 2
-        res      = self._res_mm
-        angles   = np.deg2rad(np.arange(SCAN_BINS))
-        dists    = np.array(scan_mm, dtype=np.float32)
-        valid    = dists > 0
+        cx = cy = GRID_N // 2
+        cell = CELL_MM
+
+        angles = np.deg2rad(np.arange(SCAN_BINS))
+        dists  = np.array(scan_mm, dtype=np.float32)
+        valid  = dists > 0
 
         if not np.any(valid):
             return
@@ -190,94 +203,108 @@ class MappingEngine:
         v_ang  = angles[valid]
         v_dist = dists[valid]
         cos_a  = np.cos(v_ang)
-        sin_a  = -np.sin(v_ang)
+        sin_a  = -np.sin(v_ang)   # Y dibalik (image coords)
 
         locker = QtCore.QMutexLocker(self._lock)
 
-        # ── Tandai FREE SPACE (putih) di sepanjang sinar ─────────────────
-        # Sampel 15 titik merata di sepanjang setiap sinar (fully vectorized)
-        N_SAMPLES = 15
-        for frac in np.linspace(0.05, 0.92, N_SAMPLES):
-            fx = np.clip((cx + frac * (v_dist / res) * cos_a).astype(np.int32), 0, MAP_PIX - 1)
-            fy = np.clip((cy + frac * (v_dist / res) * sin_a).astype(np.int32), 0, MAP_PIX - 1)
-            self._grid[fy, fx] = np.minimum(255.0, self._grid[fy, fx] + 25.0)
+        for i in range(len(v_ang)):
+            d  = float(v_dist[i])
+            ca = float(cos_a[i])
+            sa = float(sin_a[i])
 
-        # ── Tandai OBSTACLE (hitam) di titik ujung sinar ─────────────────
-        ox = np.clip((cx + (v_dist / res) * cos_a).astype(np.int32), 0, MAP_PIX - 1)
-        oy = np.clip((cy + (v_dist / res) * sin_a).astype(np.int32), 0, MAP_PIX - 1)
-        self._grid[oy, ox] = np.maximum(0.0, self._grid[oy, ox] - 80.0)
+            # Jumlah sel yang dilewati sinar ini
+            n_cells = min(int(d / cell), GRID_N - 1)
 
+            if n_cells > 1:
+                # Tandai SEMUA sel bebas di sepanjang sinar (continuous!)
+                ts  = np.arange(1, n_cells)
+                fxs = np.clip((cx + ts * ca).astype(np.int32), 0, GRID_N - 1)
+                fys = np.clip((cy + ts * sa).astype(np.int32), 0, GRID_N - 1)
+                self._grid[fys, fxs] = np.minimum(255.0,
+                                                   self._grid[fys, fxs] + 35.0)
+
+            # Tandai sel obstacle di ujung sinar
+            ox = int(np.clip(cx + n_cells * ca, 0, GRID_N - 1))
+            oy = int(np.clip(cy + n_cells * sa, 0, GRID_N - 1))
+            self._grid[oy, ox] = max(0.0, self._grid[oy, ox] - 80.0)
+
+        # Sinkronkan ke mapbytes (GRID_N x GRID_N)
         arr = np.clip(self._grid, 0, 255).astype(np.uint8)
         self.mapbytes[:] = arr.tobytes()
 
     def get_robot_pixel(self):
+        """
+        Kembalikan posisi robot dalam koordinat GRID_N x GRID_N.
+        """
         if self.mode == 'slam':
             x, y, t = self.pose
-            scale = MAP_PIX / (MAP_METERS * 1000)
-            px = int(MAP_PIX / 2 + x * scale)
-            py = int(MAP_PIX / 2 - y * scale)
+            scale = self._map_pix / (MAP_METERS * 1000)
+            px = int(self._map_pix / 2 + x * scale)
+            py = int(self._map_pix / 2 - y * scale)
+            N  = self._map_pix
         else:
-            px = py = MAP_PIX // 2
-            t = 0.0
-        return (max(0, min(MAP_PIX - 1, px)),
-                max(0, min(MAP_PIX - 1, py)), t)
+            px = py = GRID_N // 2
+            t  = 0.0
+            N  = GRID_N
+        return (max(0, min(N-1, px)), max(0, min(N-1, py)), t)
 
     def render_map(self):
         """
-        Render ke QImage dengan skema warna ROS RViz:
-          Hitam solid   = Obstacle / Wall
-          Putih bersih  = Free Space
-          Abu-abu netral = Unknown
+        Render grid internal → QImage GRID_N x GRID_N dengan warna RViz,
+        lalu upscale ke DISPLAY_PIX x DISPLAY_PIX dengan FastTransformation
+        → blok kotak tajam (tidak blur) ala tampilan referensi.
         """
         locker = QtCore.QMutexLocker(self._lock)
-        arr = np.frombuffer(bytes(self.mapbytes), dtype=np.uint8).reshape(MAP_PIX, MAP_PIX)
-        rgb = np.full((MAP_PIX, MAP_PIX, 3), 127, dtype=np.uint8)  # Default: RViz grey
 
         if self.mode == 'slam':
-            mask_occ = (arr > 0) & (arr < 110)
-            mask_fre = arr >= 110
-            rgb[mask_occ] = [0,   0,   0]    # Hitam: obstacle
-            rgb[mask_fre] = [236, 236, 236]  # Putih: free
+            N   = self._map_pix
+            arr = np.frombuffer(bytes(self.mapbytes), dtype=np.uint8).reshape(N, N)
+            rgb = np.full((N, N, 3), 127, dtype=np.uint8)
+            rgb[(arr > 0) & (arr < 110)] = [0, 0, 0]       # Hitam: obstacle
+            rgb[arr >= 110]              = [236, 236, 236]  # Putih: free
         else:
-            mask_occ = arr < 100             # Sel terkena obstacle
-            mask_fre = arr > 143             # Sel terkonfirmasi bebas
-            rgb[mask_occ] = [0,   0,   0]    # Hitam: obstacle
-            rgb[mask_fre] = [236, 236, 236]  # Putih: free
-            # abu-abu = 127 (sudah di-set sebagai default di atas)
+            arr = np.clip(self._grid.copy(), 0, 255).astype(np.uint8)
+            rgb = np.full((GRID_N, GRID_N, 3), 127, dtype=np.uint8)
+            rgb[arr < 100]  = [0, 0, 0]        # Hitam: obstacle
+            rgb[arr > 143]  = [236, 236, 236]  # Putih: free
+            N = GRID_N
 
-        return QtGui.QImage(
-            rgb.tobytes(), MAP_PIX, MAP_PIX,
-            MAP_PIX * 3, QtGui.QImage.Format_RGB888
+        # Buat QImage kecil
+        img_small = QtGui.QImage(
+            rgb.tobytes(), N, N, N * 3, QtGui.QImage.Format_RGB888
+        )
+
+        # Upscale TANPA interpolasi → blok kotak tajam
+        return img_small.scaled(
+            DISPLAY_PIX, DISPLAY_PIX,
+            QtCore.Qt.IgnoreAspectRatio,
+            QtCore.Qt.FastTransformation   # ← Kunci tampilan blok!
         )
 
     def reset(self):
         locker = QtCore.QMutexLocker(self._lock)
-        self.mapbytes = bytearray(MAP_PIX * MAP_PIX)
         self.pose = (0.0, 0.0, 0.0)
         self.path_px.clear()
         if self.mode == 'slam':
+            self.mapbytes = bytearray(self._map_pix * self._map_pix)
             laser = Laser(SCAN_BINS, SCAN_HZ, 360, 0, 0, 0)
-            self._slam = RMHC_SLAM(laser, MAP_PIX, MAP_METERS, random_seed=42)
+            self._slam = RMHC_SLAM(laser, self._map_pix, MAP_METERS, random_seed=42)
         else:
             self._grid[:] = 128.0
+            self.mapbytes = bytearray(GRID_N * GRID_N)
 
     def save_png(self, path):
         self.render_map().save(path)
 
 
 # ---------------------------------------------------------------------------
-# MAP UPDATE WORKER — komputasi berat di thread terpisah
+# MAP UPDATE WORKER — thread terpisah
 # ---------------------------------------------------------------------------
 
 class MapUpdateWorker(QtCore.QThread):
-    """
-    Thread khusus untuk update occupancy grid.
-    UI thread TIDAK pernah menunggu komputasi peta.
-    Hanya proses scan terbaru (drop scan lama jika antrian menumpuk).
-    """
     map_updated = QtCore.pyqtSignal()
 
-    def __init__(self, engine: MappingEngine):
+    def __init__(self, engine):
         super().__init__()
         self.engine  = engine
         self._queue  = []
@@ -285,7 +312,7 @@ class MapUpdateWorker(QtCore.QThread):
         self._cond   = QtCore.QWaitCondition()
         self.running = False
 
-    def enqueue(self, scan_mm: list):
+    def enqueue(self, scan_mm):
         locker = QtCore.QMutexLocker(self._qmutex)
         self._queue = [scan_mm]   # Hanya simpan scan terbaru
         self._cond.wakeOne()
@@ -295,10 +322,9 @@ class MapUpdateWorker(QtCore.QThread):
         while self.running:
             self._qmutex.lock()
             if not self._queue:
-                self._cond.wait(self._qmutex, 200)  # Tunggu max 200ms
+                self._cond.wait(self._qmutex, 200)
             scan = self._queue.pop(0) if self._queue else None
             self._qmutex.unlock()
-
             if scan is not None:
                 self.engine.update(scan)
                 self.map_updated.emit()
@@ -314,12 +340,12 @@ class MapUpdateWorker(QtCore.QThread):
 # ---------------------------------------------------------------------------
 
 class MapWidget(QtWidgets.QWidget):
-    def __init__(self, engine: MappingEngine, parent=None):
+    def __init__(self, engine, parent=None):
         super().__init__(parent)
         self.engine     = engine
         self._qimg      = None
-        self._show_scan = False   # OFF by default (hemat render)
-        self._is_iso    = False   # 2D by default (lebih ringan)
+        self._show_scan = False
+        self._is_iso    = True     # Default: Isometric seperti referensi
         self._last_scan = []
         self.setMinimumSize(580, 580)
         self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, True)
@@ -336,86 +362,88 @@ class MapWidget(QtWidgets.QWidget):
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
-
         w, h = self.width(), self.height()
-        # Latar belakang RViz — abu-abu gelap
         painter.fillRect(self.rect(), QtGui.QColor(44, 54, 63))
 
         if not self._qimg or self._qimg.isNull():
             painter.setPen(QtGui.QColor(200, 200, 200))
             painter.setFont(QtGui.QFont("Courier New", 13))
-            painter.drawText(self.rect(), QtCore.Qt.AlignCenter, "Menunggu data LiDAR...")
+            painter.drawText(self.rect(), QtCore.Qt.AlignCenter,
+                             "Menunggu data LiDAR...")
             return
 
+        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, False)
         painter.save()
 
-        # Transformasi Isometrik
         if self._is_iso:
-            painter.translate(w / 2.0, h / 2.0 + 20)
-            painter.scale(1.0, 0.60)
+            painter.translate(w / 2.0, h / 2.0 + 10)
+            painter.scale(1.0, 0.58)
             painter.rotate(-45)
             painter.translate(-w / 2.0, -h / 2.0)
 
-        # Gambar peta
-        margin = 0.06
-        tr = QtCore.QRectF(w * margin, h * margin,
-                           w * (1 - 2*margin), h * (1 - 2*margin))
+        # Gambar peta (sudah dalam DISPLAY_PIX x DISPLAY_PIX)
+        mg  = 0.05
+        tr  = QtCore.QRectF(w*mg, h*mg, w*(1-2*mg), h*(1-2*mg))
         painter.drawImage(tr, self._qimg)
 
-        sx = tr.width()  / MAP_PIX
-        sy = tr.height() / MAP_PIX
+        sx = tr.width()  / DISPLAY_PIX
+        sy = tr.height() / DISPLAY_PIX
         ox, oy = tr.left(), tr.top()
 
-        def ts(px, py): return (ox + px*sx, oy + py*sy)
-
-        # Grid 1-meter (tipis, lebih ringan dengan hanya menggambar garis utama)
-        step_px = MAP_PIX / MAP_METERS
-        painter.setPen(QtGui.QPen(QtGui.QColor(80, 90, 100, 80), 1, QtCore.Qt.DotLine))
-        for i in range(1, int(MAP_METERS)):
-            gx = ox + i * step_px * sx
-            gy = oy + i * step_px * sy
-            painter.drawLine(QtCore.QPointF(gx, tr.top()),    QtCore.QPointF(gx, tr.bottom()))
-            painter.drawLine(QtCore.QPointF(tr.left(), gy),   QtCore.QPointF(tr.right(), gy))
+        # Faktor konversi grid-sel → pixel layar
+        # 1 sel = (DISPLAY_PIX/GRID_N) pixel display → lalu sx ke layar
+        def grid_to_screen(gx, gy):
+            dpx = (gx + 0.5) * (DISPLAY_PIX / GRID_N)
+            dpy = (gy + 0.5) * (DISPLAY_PIX / GRID_N)
+            return (ox + dpx * sx, oy + dpy * sy)
 
         # Jalur robot
         path = self.engine.path_px
         if len(path) >= 2:
-            painter.setPen(QtGui.QPen(QtGui.QColor(255, 60, 60, 200), 2))
+            N = self.engine._map_pix if self.engine.mode == 'slam' else GRID_N
+            scale_d = DISPLAY_PIX / N
+            painter.setPen(QtGui.QPen(QtGui.QColor(255, 60, 60, 220), 2))
             for i in range(1, len(path)):
-                x0, y0 = ts(*path[i-1])
-                x1, y1 = ts(*path[i])
-                painter.drawLine(QtCore.QPointF(x0, y0), QtCore.QPointF(x1, y1))
+                x0s = ox + (path[i-1][0] + 0.5) * scale_d * sx
+                y0s = oy + (path[i-1][1] + 0.5) * scale_d * sy
+                x1s = ox + (path[i][0]   + 0.5) * scale_d * sx
+                y1s = oy + (path[i][1]   + 0.5) * scale_d * sy
+                painter.drawLine(QtCore.QPointF(x0s, y0s),
+                                 QtCore.QPointF(x1s, y1s))
 
+        # Posisi robot
         rpx, rpy, theta = self.engine.get_robot_pixel()
-        rx_s, ry_s = ts(rpx, rpy)
+        N = self.engine._map_pix if self.engine.mode == 'slam' else GRID_N
+        scale_d = DISPLAY_PIX / N
+        rx_s = ox + (rpx + 0.5) * scale_d * sx
+        ry_s = oy + (rpy + 0.5) * scale_d * sy
 
-        # Sinar scan (disampling setiap 10 derajat agar ringan)
+        # Sinar scan (setiap 15 derajat, sangat hemat)
         if self._show_scan and self._last_scan:
-            mm_to_px = (sx * MAP_PIX) / (MAP_METERS * 1000.0)
-            painter.setPen(QtGui.QPen(QtGui.QColor(255, 160, 0, 80), 1))
-            for i in range(0, len(self._last_scan), 10):
+            mm_to_dpx = (DISPLAY_PIX / (MAP_METERS * 1000)) * sx
+            painter.setPen(QtGui.QPen(QtGui.QColor(255, 160, 0, 100), 1))
+            for i in range(0, len(self._last_scan), 15):
                 d = self._last_scan[i]
                 if d == 0: continue
                 ang = math.radians(i)
                 painter.drawLine(
                     QtCore.QPointF(rx_s, ry_s),
-                    QtCore.QPointF(rx_s + d*math.cos(ang)*mm_to_px,
-                                   ry_s - d*math.sin(ang)*mm_to_px)
+                    QtCore.QPointF(rx_s + d*math.cos(ang)*mm_to_dpx,
+                                   ry_s - d*math.sin(ang)*mm_to_dpx)
                 )
 
-        # Robot icon: sasis metalik + lidar puck orange
+        # Robot icon: sasis metalik + LiDAR puck orange
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
         painter.save()
         painter.translate(rx_s, ry_s)
         painter.rotate(-theta)
 
         # Sasis
-        painter.setPen(QtGui.QPen(QtGui.QColor(20, 20, 20), 2))
+        painter.setPen(QtGui.QPen(QtGui.QColor(15, 15, 15), 2))
         painter.setBrush(QtGui.QBrush(QtGui.QColor(55, 65, 75)))
         painter.drawRoundedRect(QtCore.QRectF(-14, -14, 28, 28), 3, 3)
 
-        # Panah depan (kuning)
+        # Panah depan
         painter.setPen(QtCore.Qt.NoPen)
         painter.setBrush(QtGui.QBrush(QtGui.QColor(255, 200, 0)))
         painter.drawPolygon(QtGui.QPolygonF([
@@ -427,9 +455,8 @@ class MapWidget(QtWidgets.QWidget):
         painter.setBrush(QtGui.QBrush(QtGui.QColor(255, 95, 0)))
         painter.drawEllipse(QtCore.QPointF(0, 0), 8, 8)
 
-        # Lensa
-        painter.setPen(QtCore.Qt.NoPen)
         painter.setBrush(QtGui.QBrush(QtGui.QColor(255, 220, 0)))
+        painter.setPen(QtCore.Qt.NoPen)
         painter.drawEllipse(QtCore.QPointF(3, 0), 3, 3)
 
         painter.restore()
@@ -459,13 +486,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("RPLIDAR RViz Mapping — Wasaka Robotic")
+        self.setWindowTitle("RPLIDAR RViz Block Mapping — Wasaka Robotic")
         self.setMinimumSize(960, 700)
         self.setStyleSheet(self._STYLE)
-
         self.engine    = MappingEngine()
         self._scan_buf = {}
-
         self._build_ui()
         self._start_workers()
 
@@ -496,18 +521,17 @@ class MainWindow(QtWidgets.QMainWindow):
             f.setStyleSheet("border:1px solid #2e3d4d;")
             return f
 
-        pl.addWidget(lbl("RVIZ GRID MAPPER", "title"))
+        pl.addWidget(lbl("RVIZ BLOCK MAPPER", "title"))
 
-        mode_text  = "SLAM MODE"   if SLAM_MODE else "STATIS MODE"
-        mode_fg    = "#51cf66"     if SLAM_MODE else "#ffd43b"
-        mode_bg    = "#1b4332"     if SLAM_MODE else "#3d2c00"
-        mode_brd   = "#40c057"     if SLAM_MODE else "#e67700"
-        self.lbl_mode = QtWidgets.QLabel(f"  {mode_text}  ")
-        self.lbl_mode.setStyleSheet(
-            f"color:{mode_fg};background:{mode_bg};border:1px solid {mode_brd};"
-            f"border-radius:4px;padding:3px 6px;font-size:12px;font-family:'Courier New';"
-        )
-        pl.addWidget(self.lbl_mode)
+        mode_text = "SLAM MODE"  if SLAM_MODE else "STATIS MODE"
+        mode_fg   = "#51cf66"    if SLAM_MODE else "#ffd43b"
+        mode_bg   = "#1b4332"    if SLAM_MODE else "#3d2c00"
+        mode_brd  = "#40c057"    if SLAM_MODE else "#e67700"
+        ml = QtWidgets.QLabel(f"  {mode_text}  ")
+        ml.setStyleSheet(f"color:{mode_fg};background:{mode_bg};"
+                         f"border:1px solid {mode_brd};border-radius:4px;"
+                         f"padding:3px 6px;font-size:12px;font-family:'Courier New';")
+        pl.addWidget(ml)
         pl.addWidget(sep())
 
         pl.addWidget(lbl("Status:"))
@@ -531,30 +555,31 @@ class MainWindow(QtWidgets.QMainWindow):
         pl.addWidget(sep())
 
         pl.addWidget(lbl("Legenda RViz:"))
-        for txt, col in [("Wall / Obstacle","#111"),
-                          ("Unknown Area",  "#7f8c8d"),
-                          ("Free Space",    "#ececec"),
-                          ("Robot LiDAR",   "#ff6000")]:
+        for txt, col, extra in [
+            ("Wall / Obstacle",  "#111111", "border:1px solid #666;"),
+            ("Unknown Area",     "#7f8c8d", ""),
+            ("Free Space",       "#ececec", "border:1px solid #aaa;"),
+            ("Robot LiDAR Puck", "#ff6000", ""),
+        ]:
             row = QtWidgets.QWidget()
             rl  = QtWidgets.QHBoxLayout(row)
             rl.setContentsMargins(0,0,0,0); rl.setSpacing(6)
             sq = QtWidgets.QLabel("■")
-            sq.setStyleSheet(f"color:{col};font-size:15px;"
-                             + ("border:1px solid #555;" if col=="#111" else ""))
+            sq.setStyleSheet(f"color:{col};font-size:15px;{extra}")
             rl.addWidget(sq); rl.addWidget(lbl(txt)); rl.addStretch()
             pl.addWidget(row)
         pl.addWidget(sep())
 
         cfg = QtWidgets.QLabel(
-            f"Map  : {MAP_PIX}×{MAP_PIX} px\n"
+            f"Grid : {GRID_N}×{GRID_N} sel\n"
             f"Area : {MAP_METERS}×{MAP_METERS} m\n"
-            f"Res  : {MAP_METERS*100/MAP_PIX:.1f} cm/px"
+            f"Res  : {CELL_MM/10:.0f} cm/sel"
         )
         cfg.setStyleSheet("color:#4a6070;font-size:11px;font-family:'Courier New';")
         pl.addWidget(cfg)
         pl.addWidget(sep())
 
-        self.btn_view = QtWidgets.QPushButton("🔄  Toggle 2D / 2.5D View")
+        self.btn_view = QtWidgets.QPushButton("🔄  2D / 2.5D Iso View")
         self.btn_view.clicked.connect(self.map_widget.toggle_view)
         pl.addWidget(self.btn_view)
 
@@ -574,23 +599,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_err = lbl("", "warn")
         self.lbl_err.setWordWrap(True)
         pl.addWidget(self.lbl_err)
-
         hl.addWidget(panel, stretch=1)
 
     def _start_workers(self):
-        # Worker peta (thread terpisah — tidak blokir UI)
         self.map_worker = MapUpdateWorker(self.engine)
         self.map_worker.map_updated.connect(self._on_map_updated)
         self.map_worker.start()
 
-        # Worker serial LiDAR
         self.lidar_worker = LidarWorker()
         self.lidar_worker.data_sig.connect(self._on_data)
         self.lidar_worker.err_sig.connect(self._on_error)
         self.lidar_worker.stats_sig.connect(self._on_stats)
         self.lidar_worker.start()
 
-        # Timer refresh GUI
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self.map_widget.refresh)
         self._timer.start(GUI_REFRESH)
@@ -599,14 +620,12 @@ class MainWindow(QtWidgets.QMainWindow):
         for ang, d, q in points:
             self._scan_buf[round(ang, 1)] = (d, q)
         self.lbl_pts.setText(str(len(self._scan_buf)))
-
         if len(self._scan_buf) >= 180:
             scan_mm = normalize_scan(
                 [(a, d, q) for a, (d, q) in self._scan_buf.items()]
             )
-            self.map_worker.enqueue(scan_mm)     # Kirim ke thread terpisah!
+            self.map_worker.enqueue(scan_mm)
             self.map_widget.set_scan(scan_mm)
-
         if "Menghubungkan" in self.lbl_status.text():
             self.lbl_status.setText("Terhubung & Berjalan")
             self.lbl_status.setStyleSheet("color:#51cf66;font-size:12px;")
@@ -617,8 +636,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_y.setText(f"Y : {y/1000:.2f} m")
         self.lbl_theta.setText(f"θ : {t:.1f}°")
 
-    def _on_stats(self, stats):
-        self.lbl_fps.setText(f"{stats['fps']} pkt/s")
+    def _on_stats(self, s):
+        self.lbl_fps.setText(f"{s['fps']} pkt/s")
 
     def _on_error(self, msg):
         self.lbl_status.setText("Error")
@@ -634,18 +653,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _save_map(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Simpan Peta", "peta_rviz.png", "PNG Image (*.png)"
+            self, "Simpan Peta", "peta_rviz_block.png", "PNG Image (*.png)"
         )
         if path:
             self.engine.save_png(path)
-            QtWidgets.QMessageBox.information(self, "Tersimpan", f"Peta disimpan ke:\n{path}")
+            QtWidgets.QMessageBox.information(self, "Tersimpan", f"Peta:\n{path}")
 
     def _reset_map(self):
-        reply = QtWidgets.QMessageBox.question(
-            self, "Reset", "Hapus peta dan jalur robot?",
+        if QtWidgets.QMessageBox.question(
+            self, "Reset", "Hapus peta?",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
-        )
-        if reply == QtWidgets.QMessageBox.Yes:
+        ) == QtWidgets.QMessageBox.Yes:
             self._scan_buf.clear()
             self.engine.reset()
             self.lbl_x.setText("X : -")
